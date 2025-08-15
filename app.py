@@ -71,7 +71,6 @@ def ask_gpt(prompt: str) -> str:
         return "⚠️ OPENAI_API_KEY не задан в Variables Railway."
     try:
         # Вариант через Chat Completions (устойчивый и простой)
-        # Документация: https://platform.openai.com/docs/api-reference/chat
         resp = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[
@@ -100,6 +99,24 @@ def webhook():
     msg_id = message.get("message_id")
 
     print("UPDATE:", update, flush=True)
+
+    # 0) Реакция 👍 на фото в группах/супергруппах
+    photos = message.get("photo") or []
+    has_photo = isinstance(photos, list) and len(photos) > 0
+    if chat_id and msg_id and has_photo and chat_type in ("group", "supergroup"):
+        try:
+            requests.post(
+                f"{TG_API}/setMessageReaction",
+                json={
+                    "chat_id": chat_id,
+                    "message_id": msg_id,
+                    "reaction": [ {"type": "emoji", "emoji": "👍"} ],
+                    # "is_big": True   # можно раскомментировать, если хочешь «большой» лайк (если поддерживается)
+                },
+                timeout=5
+            )
+        except Exception as e:
+            print(f"setMessageReaction error: {e}", flush=True)
 
     # 1) Модерация: удаляем мат в группах
     if chat_id and msg_id and chat_type in ("group", "supergroup") and has_profanity(text):
@@ -139,6 +156,11 @@ def webhook():
         requests.post(f"{TG_API}/sendMessage", json={"chat_id": chat_id, "text": reply})
 
     return "ok"
+
+if __name__ == "__main__":
+    # локальный запуск (на Railway нас запускает gunicorn)
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
 
 if __name__ == "__main__":
     # локальный запуск (на Railway нас запускает gunicorn)
