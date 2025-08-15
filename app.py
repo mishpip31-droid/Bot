@@ -1,7 +1,8 @@
-import os, re, requests
+import os, re, requests, random
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from flask import Flask, request
+from apscheduler.schedulers.background import BackgroundScheduler
 
 # ===== Telegram =====
 TOKEN = os.environ["TELEGRAM_TOKEN"]
@@ -15,8 +16,12 @@ SYSTEM_PROMPT = os.environ.get("SYSTEM_PROMPT", "You are a helpful assistant. Re
 
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
-# Часовой пояс для отсчёта до НГ
+# Часовой пояс
 TZ = ZoneInfo(os.environ.get("TZ", "Europe/Minsk"))
+
+# Куда слать задания по языку
+LANG_CHAT_ID = os.environ.get("LANG_CHAT_ID")  # пример: "123456789" или "-1001234567890"
+RUN_JOBS = os.environ.get("RUN_JOBS", "0") == "1"  # защита от дублей при нескольких воркерах
 
 app = Flask(__name__)
 
@@ -26,7 +31,6 @@ BAD_WORDS = {
     "fuck", "shit", "bitch", "asshole", "dick", "fucker", "motherf"
 }
 BAD_RE = re.compile("|".join(re.escape(w).replace(r"\*", ".*") for w in BAD_WORDS), re.IGNORECASE)
-
 def has_profanity(text: str) -> bool:
     return bool(text and BAD_RE.search(text.lower()))
 
@@ -37,7 +41,6 @@ NY_PATTERNS = [
     r"\bкогда\s+нов(ый|ый)\s*год\b",
 ]
 NY_RE = re.compile("|".join(NY_PATTERNS), re.IGNORECASE)
-
 def is_new_year_query(text: str) -> bool:
     return bool(text and NY_RE.search(text))
 
@@ -70,8 +73,6 @@ def ask_gpt(prompt: str) -> str:
     if not client:
         return "⚠️ OPENAI_API_KEY не задан в Variables Railway."
     try:
-        # Вариант через Chat Completions (устойчивый и простой)
-        # Документация: https://platform.openai.com/docs/api-reference/chat
         resp = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[
@@ -84,6 +85,47 @@ def ask_gpt(prompt: str) -> str:
         return resp.choices[0].message.content.strip()
     except Exception as e:
         return f"Ошибка GPT: {e}"
+
+# ---------- ЕЖЕДНЕВНЫЕ ЗАДАНИЯ ПО АНГЛИЙСКОМУ ----------
+WORDS = [
+    ("adventure", "приключение", "I had an amazing adventure last summer."),
+    ("discover", "открывать", "They discovered a hidden cave."),
+    ("beautiful", "красивый", "This is the most beautiful place I've ever seen."),
+    ("challenge", "вызов", "Learning a new language is a challenge."),
+    ("enjoy", "наслаждаться", "I enjoy reading books in the evening."),
+    ("attempt", "попытка", "This is my second attempt."),
+    ("improve", "улучшать", "I want to improve my English."),
+]
+
+def build_daily_task() -> str:
+    word, translation, example = random.choice(WORDS)
+    task_text = (
+        "📚 *Ежедневное задание по английскому*\n\n"
+        f"**Слово дня:** {word} — {translation}\n"
+        f"**Пример:** {example}\n\n"
+        "✏️ *Задание:* Переведи на английский фразу:\n"
+        f"— «Вчера я {translation}».\n\n"
+        "_Ответь прямо в чате. Команда /lang — прислать задание сейчас._"
+    )
+    return task_text
+
+def send_daily_english_task():
+    if not LANG_CHAT_ID:
+        print("⚠️ LANG_CHAT_ID не задан — пропускаем рассылку")
+        return
+    text = build_daily_task()
+    requests.post(f"{TG_API}/sendMessage", json={
+        "chat_id": LANG_CHAT_ID,
+        "text": text,
+        "parse_mode": "Markdown"
+    })
+    print(f"[{datetime.now(TZ)}] Задание отправлено в {LANG_CHAT_ID}")
+
+# Планировщик (защита от дублей при нескольких воркерах)
+if RUN_JOBS:
+    scheduler = BackgroundScheduler(timezone=str(TZ))
+    scheduler.add_job(send_daily_english_task, "cron", hour=8, minute=0, id="lang_daily", replace_existing=True)
+    scheduler.start()
 
 @app.get("/")
 def health():
@@ -119,11 +161,20 @@ def webhook():
         })
         return "ok"
 
+    # 2.1) Команда /lang — прислать задание сейчас
+    if chat_id and text.lower().startswith("/lang"):
+        requests.post(f"{TG_API}/sendMessage", json={
+            "chat_id": chat_id,
+            "text": build_daily_task(),
+            "parse_mode": "Markdown",
+            "reply_to_message_id": msg_id
+        })
+        return "ok"
+
     # 3) GPT: команда /gpt <вопрос> (в группе и в приватке)
     if chat_id and (text.lower().startswith("/gpt ") or text.lower() == "/gpt"):
         query = text[4:].strip() or "Привет! Расскажи, что ты умеешь?"
         answer = ask_gpt(query)
-        # ограничим длину на всякий случай
         if len(answer) > 3500:
             answer = answer[:3500] + "…"
         requests.post(f"{TG_API}/sendMessage", json={
