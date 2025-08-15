@@ -77,7 +77,7 @@ def ask_gpt(prompt: str) -> str:
                 {"role": "user", "content": prompt}
             ],
             temperature=0.7,
-            max_tokens=120,
+            max_tokens=300,
         )
         return (resp.choices[0].message.content or "").strip()
     except Exception as e:
@@ -158,6 +158,92 @@ def should_tell_trigger_joke(chat_id: int, text: str) -> bool:
     last_trigger_joke_at[chat_id] = now_ts
     return True
 
+# ---------- УТРЕННЯЯ СВОДКА (09:00) ----------
+from apscheduler.schedulers.background import BackgroundScheduler
+DAILY_CHAT_ID = os.environ.get("DAILY_CHAT_ID")  # группа для рассылки
+RUN_JOBS = os.environ.get("RUN_JOBS", "0") == "1"
+
+def get_minsk_weather():
+    try:
+        r = requests.get("https://wttr.in/Minsk?format=j1", timeout=8)
+        data = r.json()
+        cur = data["current_condition"][0]
+        temp = cur.get("temp_C")
+        feels = cur.get("FeelsLikeC")
+        desc = (cur.get("weatherDesc") or [{"value": ""}])[0]["value"]
+        chance_rain = (data["weather"][0]["hourly"][0].get("chanceofrain") or "0")
+        return {"temp": temp, "feels": feels, "desc": desc, "chance_rain": chance_rain}
+    except Exception as e:
+        print(f"weather error: {e}", flush=True)
+        return None
+
+def days_to_new_year():
+    now = datetime.now(TZ)
+    target = datetime(now.year + 1, 1, 1, tzinfo=TZ)
+    return (target - now).days
+
+def build_daily_summary_text():
+    weather = get_minsk_weather()
+    days = days_to_new_year()
+
+    weather_line = "Погода не загрузилась 🌦️"
+    if weather:
+        weather_line = (
+            f"Минск: {weather['temp']}°C (ощущается как {weather['feels']}°C), "
+            f"{(weather['desc'] or '').lower()}, шанс дождя {weather['chance_rain']}%."
+        )
+
+    if client:
+        prompt = (
+            "Собери короткую утреннюю сводку в 4 пунктах на русском, с эмодзи и Markdown:\n"
+            "1) Доброе, уютное приветствие на день (1–2 предложения).\n"
+            "2) Маленькая «коузи-новость» — нейтральная, добрая, без политики и фактов, не выдавай за реальную новость.\n"
+            "3) Фраза дня — короткая вдохновляющая цитата.\n"
+            f"4) Погода и обратный отсчёт: {weather_line} | До Нового года: {days} дней.\n\n"
+            "Требования:\n"
+            "- Коротко и дружелюбно.\n"
+            "- Оформи заголовки пунктов жирным, добавь подходящие смайлики.\n"
+            "- Не используй ссылки и источники.\n"
+            "- Не придумывай проверяемых фактов — «коузи-новость» должна быть вымышленной и очевидно доброй."
+        )
+        text = ask_gpt(prompt)
+        if text and not text.startswith("Ошибка GPT"):
+            return text
+
+    # Фолбэк без GPT
+    return (
+        "🌅 *Доброе утро!*\n"
+        "Пусть сегодня будет спокойно и уютно — береги себя и близких.\n\n"
+        "📰 *Коузи-новость*\n"
+        "Где-то кто-то испёк коричный пирог и поделился теплом с соседями — пусть и к тебе заглянет немного уюта.\n\n"
+        "💬 *Фраза дня*\n"
+        "_Маленькие шаги приводят к большим переменам._\n\n"
+        f"🌦️ *Погода*: {weather_line}\n"
+        f"🎄 *До Нового года*: {days} дней"
+    )
+
+def send_daily_summary():
+    chat_id = DAILY_CHAT_ID
+    if not chat_id:
+        print("⚠️ DAILY_CHAT_ID не задан — пропускаем утреннюю сводку", flush=True)
+        return
+    text = build_daily_summary_text()
+    try:
+        requests.post(f"{TG_API}/sendMessage", json={
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "Markdown"
+        }, timeout=10)
+        print(f"[{datetime.now(TZ)}] Утренняя сводка отправлена в {chat_id}", flush=True)
+    except Exception as e:
+        print(f"send summary error: {e}", flush=True)
+
+# Планировщик — ежедневно в 09:00 по TZ
+if RUN_JOBS:
+    scheduler = BackgroundScheduler(timezone=str(TZ))
+    scheduler.add_job(send_daily_summary, "cron", hour=9, minute=0, id="morning_summary", replace_existing=True)
+    scheduler.start()
+
 @app.get("/")
 def health():
     return "ok"
@@ -228,6 +314,17 @@ def webhook():
         })
         return "ok"
 
+    # 2.5) /morning — прислать сводку сразу (в любой чат)
+    if chat_id and text.lower().strip() == "/morning":
+        summary = build_daily_summary_text()
+        requests.post(f"{TG_API}/sendMessage", json={
+            "chat_id": chat_id,
+            "text": summary,
+            "parse_mode": "Markdown",
+            "reply_to_message_id": msg_id
+        })
+        return "ok"
+
     # 2.9) /joke — шутка по запросу (Санта-стайл)
     if chat_id and text.lower().strip() == "/joke":
         send_santa_joke(chat_id, msg_id, username, text)
@@ -256,3 +353,4 @@ def webhook():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
