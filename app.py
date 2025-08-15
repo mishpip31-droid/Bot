@@ -83,7 +83,7 @@ def ask_gpt(prompt: str) -> str:
     except Exception as e:
         return f"Ошибка GPT: {e}"
 
-# ---------- САНТА-ШУТКИ ПО ТРИГГЕРАМ ----------
+# ---------- САНТА-ШУТКИ ----------
 TRIGGER_PATTERNS = [
     r"\bпривет(,)?\b",
     r"\bскучно\b",
@@ -94,8 +94,14 @@ TRIGGER_PATTERNS = [
 ]
 TRIGGER_RE = re.compile("|".join(TRIGGER_PATTERNS), re.IGNORECASE)
 
-JOKE_COOLDOWN_MIN = int(os.environ.get("JOKE_COOLDOWN_MIN", "15"))
-last_joke_at: dict[int, float] = {}  # chat_id -> ts
+JOKE_COOLDOWN_MIN = int(os.environ.get("JOKE_COOLDOWN_MIN", "15"))       # кулдаун на чат для триггерных шуток
+RANDOM_JOKE_PROB = float(os.environ.get("RANDOM_JOKE_PROB", "0.10"))     # 10% шанс на любое сообщение
+HOURLY_JOKE_INTERVAL_MIN = int(os.environ.get("HOURLY_JOKE_INTERVAL_MIN", "60"))  # «раз в час» на чат
+
+# трекеры времени (секунды unixtime)
+last_trigger_joke_at: dict[int, float] = {}   # по триггерам
+last_hourly_joke_at:  dict[int, float] = {}   # раз в час
+last_random_joke_at:  dict[int, float] = {}   # случайные
 
 CANNED_JOKES = [
     "Почему Санта не пользуется лифтом? Он верит в силу санок! 🎅🛷",
@@ -115,7 +121,7 @@ def gen_santa_joke(username: str | None, context: str | None) -> str:
         try:
             prompt = (
                 "Скажи ОДНУ очень короткую, добрую и безопасную шутку на русском (до 15 слов) "
-                "ОТ ЛИЦА САНТА КЛАУСА. Можно лёгкий зимний/новогодний вайб, без токсичности и политики. "
+                "ОТ ЛИЦА САНТА КЛАУСА. Лёгкий зимний/новогодний вайб, без токсичности и политики. "
                 f"Имя пользователя: {username or 'друг'}. Контекст: {(context or '')[:80]}"
             )
             resp = client.chat.completions.create(
@@ -133,14 +139,23 @@ def gen_santa_joke(username: str | None, context: str | None) -> str:
             return random.choice(CANNED_JOKES)
     return random.choice(CANNED_JOKES)
 
-def should_tell_joke(chat_id: int, text: str) -> bool:
+def send_santa_joke(chat_id: int, reply_to: int | None, username: str | None, context_text: str | None):
+    joke = gen_santa_joke(username, context_text)
+    if not joke:
+        return
+    payload = {"chat_id": chat_id, "text": joke}
+    if reply_to:
+        payload["reply_to_message_id"] = reply_to
+    requests.post(f"{TG_API}/sendMessage", json=payload)
+
+def should_tell_trigger_joke(chat_id: int, text: str) -> bool:
     if not text or not TRIGGER_RE.search(text):
         return False
     now_ts = time.time()
-    last_ts = last_joke_at.get(chat_id, 0)
+    last_ts = last_trigger_joke_at.get(chat_id, 0)
     if now_ts - last_ts < JOKE_COOLDOWN_MIN * 60:
         return False
-    last_joke_at[chat_id] = now_ts
+    last_trigger_joke_at[chat_id] = now_ts
     return True
 
 @app.get("/")
@@ -156,10 +171,11 @@ def webhook():
     chat_type = chat.get("type")  # private | group | supergroup | channel
     text = (message.get("text") or "").strip()
     msg_id = message.get("message_id")
+    username = (message.get("from") or {}).get("first_name")
 
     print("UPDATE:", update, flush=True)
 
-    # 0) Реакция 👍 на фото в группах
+    # 0) Реакция 👍 на фото (в группах)
     photos = message.get("photo") or []
     if chat_id and msg_id and photos and chat_type in ("group", "supergroup"):
         try:
@@ -175,7 +191,7 @@ def webhook():
         except Exception as e:
             print(f"setMessageReaction error: {e}", flush=True)
 
-    # 1) Модерация
+    # 1) Модерация мата (в группах)
     if chat_id and msg_id and chat_type in ("group", "supergroup") and has_profanity(text):
         requests.post(f"{TG_API}/deleteMessage", json={"chat_id": chat_id, "message_id": msg_id})
         requests.post(f"{TG_API}/sendMessage", json={
@@ -184,18 +200,26 @@ def webhook():
         })
         return "ok"
 
-    # 1.1) Санта-шутки (только группы) с кулдауном
-    if chat_id and chat_type in ("group", "supergroup") and should_tell_joke(chat_id, text):
-        username = (message.get("from") or {}).get("first_name")
-        joke = gen_santa_joke(username, text)
-        if joke:
-            requests.post(f"{TG_API}/sendMessage", json={
-                "chat_id": chat_id,
-                "text": joke,
-                "reply_to_message_id": msg_id
-            })
+    # 1.1) Санта-шутки по триггерам (в группах, с кулдауном)
+    if chat_id and chat_type in ("group", "supergroup") and should_tell_trigger_joke(chat_id, text):
+        send_santa_joke(chat_id, msg_id, username, text)
 
-    # 2) Вопрос про Новый год
+    # 1.2) Дополнительно: «раз в час» ИЛИ 10% случайно (в группах)
+    if chat_id and chat_type in ("group", "supergroup"):
+        now_ts = time.time()
+        # (A) «Раз в час» — не чаще, чем раз в HOURLY_JOKE_INTERVAL_MIN для этого чата
+        last_hourly = last_hourly_joke_at.get(chat_id, 0)
+        if now_ts - last_hourly >= HOURLY_JOKE_INTERVAL_MIN * 60:
+            send_santa_joke(chat_id, None, username, text)
+            last_hourly_joke_at[chat_id] = now_ts
+        else:
+            # (B) Случайная 10% — без спама (не чаще, чем раз в JOKE_COOLDOWN_MIN)
+            last_random = last_random_joke_at.get(chat_id, 0)
+            if now_ts - last_random >= JOKE_COOLDOWN_MIN * 60 and random.random() < RANDOM_JOKE_PROB:
+                send_santa_joke(chat_id, None, username, text)
+                last_random_joke_at[chat_id] = now_ts
+
+    # 2) Ответ на вопрос про Новый год
     if chat_id and is_new_year_query(text):
         requests.post(f"{TG_API}/sendMessage", json={
             "chat_id": chat_id,
@@ -204,15 +228,9 @@ def webhook():
         })
         return "ok"
 
-    # 2.9) /joke — шутка по запросу
+    # 2.9) /joke — шутка по запросу (Санта-стайл)
     if chat_id and text.lower().strip() == "/joke":
-        username = (message.get("from") or {}).get("first_name")
-        joke = gen_santa_joke(username, text)
-        requests.post(f"{TG_API}/sendMessage", json={
-            "chat_id": chat_id,
-            "text": joke,
-            "reply_to_message_id": msg_id
-        })
+        send_santa_joke(chat_id, msg_id, username, text)
         return "ok"
 
     # 3) GPT: /gpt ...
